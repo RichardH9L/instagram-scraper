@@ -77,6 +77,8 @@ const formatSinglePost = (node) => {
         locationId: node.location ? node.location.id : null,
         ownerFullName: node.owner ? node.owner.full_name : null,
         ownerUsername: node.owner ? node.owner.username : null,
+        ownerProfilePicUrl: node.owner ? node.owner.profile_pic_url : null,
+        ownerProfilePicUrlHd: node.owner ? node.owner.profile_pic_url_hd : null,
         ownerId: node.owner ? node.owner.id : null,
         productType: node.product_type,
         isSponsored: node.is_ad,

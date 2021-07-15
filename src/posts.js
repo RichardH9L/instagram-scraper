@@ -83,7 +83,8 @@ const scrapePost = (request, itemSpec, entryData, additionalData) => {
         timestamp: new Date(parseInt(item.taken_at_timestamp, 10) * 1000),
         locationName: (item.location && item.location.name) || null,
         ownerUsername: (item.owner && item.owner.username) || null,
-        ownerProfilePicUrl: (item.owner && item.owner.profile_pic_url) || null
+        ownerProfilePicUrl: (item.owner && item.owner.profile_pic_url) || null,
+        ownerProfilePicUrlHd: (item.owner && item.owner.profile_pic_url_hd) || null
     };
 };
 
