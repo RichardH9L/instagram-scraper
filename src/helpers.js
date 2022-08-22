@@ -1,133 +1,439 @@
 const Apify = require('apify');
-const tunnel = require('tunnel');
-const { CookieJar } = require('tough-cookie');
-const got = require('got');
 const vm = require('vm');
-const { URLSearchParams } = require('url');
+const moment = require('moment');
 const Puppeteer = require('puppeteer'); // eslint-disable-line no-unused-vars
-const get = require('lodash.get');
-const errors = require('./errors');
-const { expandOwnerDetails } = require('./user-details');
-const { PAGE_TYPES, GRAPHQL_ENDPOINT, LOG_TYPES, PAGE_TYPE_URL_REGEXES, HEADERS } = require('./consts');
+const { gotScraping } = require('got-scraping');
+const { PAGE_TYPES, PAGE_TYPE_PATH_REGEXES, GRAPHQL_ENDPOINT, SCRAPE_TYPES } = require('./consts');
 
-const { sleep, requestAsBrowser } = Apify.utils;
+const { sleep, log } = Apify.utils;
 
 /**
- * @param {Array<{ obj: any, paths: string[] }>} objs
- * @param {any} [fallback]
+ * Parses the __additionalData from script tags, as the
+ * window property gets emptied after being consumed
+ *
+ * @param {Puppeteer.Page} page
  */
-const coalesce = (objs, fallback = {}) => {
-    return objs.reduce((out, { obj, paths }) => {
-        return out || paths.reduce((found, path) => (typeof found !== 'undefined' ? found : get(obj, path)), undefined);
-    }, undefined) || fallback;
+const getAdditionalData = (page) => {
+    return page.evaluate(async () => {
+        const script = [...document.querySelectorAll('script')].find((s) => /__additionalDataLoaded\(/.test(s.innerHTML));
+
+        if (script) {
+            try {
+                return JSON.parse(script.innerHTML.split(/window\.__additionalDataLoaded\([^,]+?,/, 2)[1].slice(0, -2));
+            } catch (e) {}
+        }
+
+        return {};
+    });
 };
 
+/**
+ * Contains almost the same shape as _sharedData, can indicate the page load
+ * has finished loading
+ *
+ * @param {Puppeteer.Page} page
+ */
+const getEntryData = async (page) => {
+    try {
+        await page.waitForFunction(() => {
+            // eslint-disable-next-line no-underscore-dangle
+            return (window?._sharedData);
+        }, { timeout: 30000 });
+    } catch (e) {
+        throw new Error('Page took too long to load initial data, trying again.');
+    }
+
+    return page.evaluate(() => window?._sharedData?.entry_data);
+};
+
+/**
+ * fix instagram console errors, they forgot to add it to the window variable
+ * click consent dialogs if they popup.
+ *
+ * makes the page always scrollable even with a modal showing
+ *
+ * accepts any cookie modal when they randomly pop-up
+ *
+ * @param {Puppeteer.Page} page
+ */
+const addLoopToPage = async (page) => {
+    await page.evaluateOnNewDocument(() => {
+        window.__bufferedErrors = window.__bufferedErrors || [];
+
+        window.addEventListener('load', () => {
+            window.onerror = () => {};
+
+            const closeModal = () => {
+                document.body.style.overflow = 'auto';
+
+                const cookieModalButton = document.querySelectorAll('[role="presentation"] [role="dialog"] button:first-of-type');
+
+                for (const button of cookieModalButton) {
+                    if (!button.closest('#loginForm')) {
+                        button.click();
+                    } else {
+                        const loginModal = button.closest('[role="presentation"]');
+                        if (loginModal) {
+                            loginModal.remove();
+                        }
+                    }
+                }
+
+                setTimeout(closeModal, 100);
+            };
+
+            closeModal();
+        });
+    });
+};
+
+/**
+ * Creates a promise that can be resolved/rejected from the outside
+ * Allows to query for the resolved status.
+ *
+ * Uses setTimeout to schedule the resolving/rejecting to the next
+ * event loop, so things like Promise.race/all have a chance to attach
+ * to them.
+ */
+const deferred = () => {
+    /** @type {(val: any) => void} */
+    let resolve = () => {};
+    /** @type {(err?: Error) => void} */
+    let reject = () => {};
+    let resolved = false;
+    let handled = false;
+    let bail = 100;
+    const promise = new Promise((_resolve, _reject) => {
+        resolve = (val) => {
+            if (!resolved) {
+                resolved = true;
+                setTimeout(() => {
+                    _resolve(val);
+                });
+            }
+        };
+        reject = (err) => {
+            if (!resolved) {
+                resolved = true;
+                const isHandled = () => {
+                    if (!handled) {
+                        bail--;
+                        // this is needed because of page.on('response') racing condition
+                        // if the emitter, that is synchronous, throws before we await/catch the promise
+                        // the whole program crashes.
+                        // On the other hand, it will make a promise that will never finish in rare cases,
+                        // considerHandled() should always be raced against a timeout or something
+                        if (bail > 0) {
+                            setTimeout(isHandled, 100);
+                        } else {
+                            log.debug(`Promise was not handled in time`);
+                        }
+                        return;
+                    }
+                    _reject(err);
+                };
+                setTimeout(isHandled);
+            }
+        };
+    });
+    return {
+        promise,
+        considerHandled() {
+            handled = true;
+            return promise;
+        },
+        get resolved() {
+            return resolved;
+        },
+        resolve,
+        reject,
+    };
+};
+
+/**
+ * Translates word to have first letter uppercased so word will become Word
+ * @param {string} word
+ */
+const uppercaseFirstLetter = (word) => {
+    const uppercasedLetter = word.charAt(0).toUpperCase();
+    const restOfTheWord = word.slice(1);
+    return `${uppercasedLetter}${restOfTheWord}`;
+};
+
+/**
+ * @param {string} jsonAddress
+ */
+const formatJSONAddress = (jsonAddress) => {
+    if (!jsonAddress) return '';
+    const address = (() => {
+        try {
+            return JSON.parse(jsonAddress);
+        } catch (err) {
+            return '';
+        }
+    })();
+
+    return Object.keys(address).reduce((result, key) => {
+        const parsedKey = key.split('_').map(uppercaseFirstLetter).join('');
+        result[`address${parsedKey}`] = address[key];
+        return result;
+    }, {});
+};
+
+/**
+ * @param {{
+ *   hash: string,
+ *   variables: Record<string, any>
+ * }} params
+ */
+const queryHash = ({
+    hash,
+    variables,
+}) => {
+    return new URLSearchParams([
+        ['query_hash', hash],
+        ['variables', JSON.stringify(variables)],
+    ]);
+};
+
+/**
+ * @param {string} url
+ * @param {Puppeteer.Page} page
+ * @param {(data: any) => any} nodeTransformationFunc
+ * @param {string} logPrefix
+ * @param {boolean} [isData]
+ */
+const query = async (
+    url,
+    page,
+    nodeTransformationFunc,
+    logPrefix,
+    isData = true,
+) => {
+    let retries = 0;
+
+    while (retries < 5) {
+        try {
+            const body = await page.evaluate(async ({ url, APP_ID, ASBD }) => {
+                const res = await fetch(url, {
+                    headers: {
+                        'user-agent': window.navigator.userAgent,
+                        accept: '*/*',
+                        'accept-language': `${window.navigator.language};q=0.9`,
+                        'x-asbd-id': ASBD,
+                        'x-ig-app-id': APP_ID,
+                        'x-ig-www-claim': sessionStorage.getItem('www-claim-v2') || '0',
+                        ...(url.includes('/v1') ? {} : {
+                            'x-csrftoken': window._sharedData?.config?.csrf_token
+                            ?? window.__initialData?.data?.config.csrf_token,
+                            'x-requested-with': 'XMLHttpRequest',
+                        }),
+                    },
+                    referrer: 'https://www.instagram.com/',
+                    credentials: 'include',
+                    mode: 'cors',
+                });
+
+                if (res.status !== 200) {
+                    throw new Error(`Status code ${res.status}`);
+                }
+
+                try {
+                    return await res.json();
+                } catch (e) {
+                    throw new Error('Invalid response returned');
+                }
+            }, {
+                url,
+                APP_ID: process.env.APP_ID,
+                ASBD: process.env.ASBD,
+            });
+
+            if (isData && !body?.data) throw new Error(`${logPrefix} - GraphQL query does not contain data`);
+
+            return nodeTransformationFunc(isData ? body.data : body);
+        } catch (error) {
+            log.debug('query', { url, message: error.message });
+
+            if (error.message.includes('429')) {
+                log.warning(`${logPrefix} - Encountered rate limit error, waiting ${(retries + 1) * 10} seconds.`);
+
+                await sleep((retries++ + 1) * 10000);
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    log.warning(`${logPrefix} - Could not load more items`);
+
+    return { nextPageCursor: null, data: [] };
+};
+
+/**
+     * @param {Puppeteer.Page} page
+     */
+const acceptCookiesDialog = async (page) => {
+    const acceptBtn = '[role="dialog"] button:first-of-type';
+
+    try {
+        await page.waitForSelector(acceptBtn, { timeout: 5000 });
+    } catch (e) {
+        return false;
+    }
+
+    const [allowBtn] = await page.$x('//button[contains(., "cookie") and contains(., "Only")]');
+
+    await Promise.all([
+        page.waitForResponse(() => true),
+        allowBtn.click(),
+    ]);
+
+    return true;
+};
+
+/**
+ *
+ * @param {string} hash
+ * @param {Record<string, any>} variables
+ * @param {(data: any) => any} nodeTransformationFunc
+ * @param {number} limit
+ * @param {Puppeteer.Page} page
+ * @param {string} logPrefix
+ */
+const finiteQuery = async (hash, variables, nodeTransformationFunc, limit, page, logPrefix) => {
+    if (!limit) {
+        return [];
+    }
+
+    log.info(`${logPrefix} - Loading up to ${limit} items`);
+
+    let hasNextPage = true;
+    let endCursor = null;
+
+    /** @type {any[]} */
+    const results = [];
+    do {
+        const queryParams = {
+            hash,
+            variables: {
+                ...variables,
+                first: 50,
+            },
+        };
+
+        if (endCursor) queryParams.variables.after = endCursor;
+
+        const { nextPageCursor, data } = await query(
+            `${GRAPHQL_ENDPOINT}?${queryHash(queryParams)}`,
+            page,
+            nodeTransformationFunc,
+            logPrefix,
+        );
+
+        results.push(...data);
+
+        if (nextPageCursor && results.length < limit) {
+            endCursor = nextPageCursor;
+            log.info(`${logPrefix} - So far loaded ${results.length} items`);
+        } else {
+            hasNextPage = false;
+        }
+    } while (hasNextPage && results.length < limit);
+
+    log.info(`${logPrefix} - Finished loading ${results.length} items`);
+
+    return results.slice(0, limit);
+};
+
+/**
+ * @param {string} hash
+ * @param {Record<string,any>} variables
+ * @param {(data: any) => any} nodeTransformationFunc
+ * @param {Puppeteer.Page} page
+ * @param {string} logPrefix
+ */
+const singleQuery = async (hash, variables, nodeTransformationFunc, page, logPrefix) => {
+    return query(
+        `${GRAPHQL_ENDPOINT}?${queryHash({ hash, variables })}`,
+        page,
+        nodeTransformationFunc,
+        logPrefix,
+    );
+};
+
+/**
+ * @param {{
+ *   proxyConfiguration?: Apify.ProxyConfiguration,
+ * }} params
+ */
+const createGotRequester = ({ proxyConfiguration }) => {
+    /**
+     * @param {{
+     *   url: string,
+     *   session?: Apify.Session,
+     *   headers?: Record<string, any>,
+     *   method?: 'GET' | 'POST',
+     *   proxyUrl?: string
+     * }} params
+     */
+    return async ({
+        url,
+        session,
+        proxyUrl = proxyConfiguration?.newUrl(session?.id ?? `sess${Math.round(Math.random() * 10000)}`),
+        headers = {},
+        method = 'GET',
+    }) => {
+        return gotScraping({
+            url,
+            method,
+            proxyUrl,
+            headers: {
+                ...headers,
+            },
+            responseType: 'json',
+            https: {
+                rejectUnauthorized: false,
+            },
+        });
+    };
+};
+
+/**
+ * @param {string} url
+ */
 const getPageTypeFromUrl = (url) => {
-    for (const [pageType, regex] of Object.entries(PAGE_TYPE_URL_REGEXES)) {
-        if (url.match(regex)) {
+    // This should not fail as we check URL validity on input schema level
+    // eslint-disable-next-line
+    const { pathname } = new URL(url);
+    for (const [pageType, regex] of Object.entries(PAGE_TYPE_PATH_REGEXES)) {
+        if (pathname.match(regex)) {
             return PAGE_TYPES[pageType];
         }
     }
 };
 
 /**
- * Takes object from _sharedData.entry_data and parses it into simpler object
- * @param {Object} entryData
- * @param {any} additionalData
+ * Deduplicates an array of objects by a property
+ * @template {Record<string, any>} T
+ * @param {string} prop
+ * @returns {(arr: T[]) => T[]}
  */
-const getItemSpec = (entryData, additionalData) => {
-    if (entryData.LocationsPage) {
-        const itemData = coalesce([
-            { obj: entryData, paths: ['LocationsPage[0].graphql.location'] },
-            { obj: additionalData, paths: ['graphql.location'] },
-        ]);
-        return {
-            pageType: PAGE_TYPES.PLACE,
-            id: itemData.slug,
-            locationId: itemData.id,
-            locationSlug: itemData.slug,
-            locationName: itemData.name,
-        };
+const dedupArrayByProperty = (prop) => (arr) => {
+    const map = new Map();
+
+    for (const item of arr) {
+        if (item && prop in item) {
+            map.set(item[prop], item);
+        }
     }
 
-    if (entryData.TagPage) {
-        const itemData = coalesce([
-            { obj: entryData, paths: ['TagPage[0].graphql.hashtag'] },
-            { obj: additionalData, paths: ['graphql.hashtag'] },
-        ]);
-        return {
-            pageType: PAGE_TYPES.HASHTAG,
-            id: itemData.name,
-            tagId: itemData.id,
-            tagName: itemData.name,
-        };
-    }
-
-    if (entryData.ProfilePage) {
-        const itemData = coalesce([
-            { obj: entryData, paths: ['ProfilePage[0].graphql.user'] },
-            { obj: additionalData, paths: ['graphql.user'] },
-        ]);
-        return {
-            pageType: PAGE_TYPES.PROFILE,
-            id: itemData.username,
-            userId: itemData.id,
-            userUsername: itemData.username,
-            userFullName: itemData.full_name,
-        };
-    }
-
-    if (entryData.PostPage) {
-        const itemData = coalesce([
-            { obj: entryData, paths: ['PostPage[0].graphql.shortcode_media'] },
-            { obj: additionalData, paths: ['graphql.shortcode_media'] },
-        ]);
-
-        return {
-            pageType: PAGE_TYPES.POST,
-            id: itemData.shortcode,
-            postCommentsDisabled: itemData.comments_disabled,
-            postIsVideo: itemData.is_video,
-            postVideoViewCount: itemData.video_view_count || 0,
-            postVideoDurationSecs: itemData.video_duration || 0,
-        };
-    }
-
-    if (entryData.StoriesPage) {
-        return {
-            pageType: PAGE_TYPES.STORY,
-        };
-    }
-
-    Apify.utils.log.info('unsupported page', entryData);
-
-    throw errors.unsupportedPage();
-};
-
-/**
- * Takes page data containing type of page and outputs short label for log line
- * @param {Object} pageData Object representing currently loaded IG page
- */
-const getLogLabel = (pageData) => {
-    switch (pageData.pageType) {
-        case PAGE_TYPES.PLACE:
-            return `Place "${pageData.locationName}"`;
-        case PAGE_TYPES.PROFILE:
-            return `User "${pageData.userUsername}"`;
-        case PAGE_TYPES.HASHTAG:
-            return `Tag "${pageData.tagName}"`;
-        case PAGE_TYPES.POST:
-            return `Post "${pageData.id}"`;
-        case PAGE_TYPES.STORY:
-            return 'Story';
-        default:
-            throw new Error('Not supported');
-    }
+    return Array.from(map.values());
 };
 
 /**
  * Takes page type and outputs variable that must be present in graphql query
- * @param {String} pageType
+ * @param {string} pageType
  */
 const getCheckedVariable = (pageType) => {
     switch (pageType) {
@@ -145,505 +451,25 @@ const getCheckedVariable = (pageType) => {
 };
 
 /**
- * Based on parsed data from current page saves a message into log with prefix identifying current page
- * @param {Object} pageData Parsed page data
- * @param {String} message Message to be outputed
- */
-function log(itemSpec, message, type = 'info') {
-    const label = getLogLabel(itemSpec);
-    Apify.utils.log[type](`${label}: ${message}`);
-}
-
-const grapqlEndpoint = 'https://www.instagram.com/graphql/query/';
-
-/**
- * @param {Puppeteer.Page} page
- * @param {{ proxy: import("apify").ProxyConfigurationOptions | undefined; } | undefined} [input]
- */
-async function getGotParams(page, input) {
-    // It is necessary to create it here as well because passing it over is to ridiculous
-    const proxyConfiguration = await Apify.createProxyConfiguration(input.proxy);
-
-    if (!proxyConfiguration) {
-        return;
-    }
-    const proxyUrl = proxyConfiguration.newUrl();
-
-    const userAgent = await page.browser().userAgent();
-
-    const proxyUrlParts = proxyUrl.match(/http:\/\/(.*)@(.*)\/?/);
-    if (!proxyUrlParts) return;
-
-    const proxyHost = proxyUrlParts[2].split(':');
-    const proxyConfig = {
-        hostname: proxyHost[0],
-        proxyAuth: proxyUrlParts[1],
-    };
-    if (proxyHost[1]) proxyConfig.port = proxyHost[1];
-
-    const agent = tunnel.httpsOverHttp({
-        proxy: proxyConfig,
-    });
-
-    const cookies = await page.cookies();
-    const cookieJar = new CookieJar();
-    cookies.forEach((cookie) => {
-        if (cookie.name === 'urlgen') return;
-        cookieJar.setCookieSync(`${cookie.name}=${cookie.value}`, 'https://www.instagram.com/', {
-            http: true,
-            secure: true,
-        });
-    });
-
-    return {
-        agent,
-        cookieJar,
-        headers: {
-            'user-agent': userAgent,
-        },
-        json: true,
-    };
-}
-
-async function query(gotParams, searchParams, nodeTransformationFunc, itemSpec, logPrefix) {
-    let retries = 0;
-    while (retries < 10) {
-        try {
-            const { body } = await got(`${grapqlEndpoint}?${searchParams.toString()}`, gotParams);
-            if (!body.data) throw new Error(`${logPrefix} - GraphQL query does not contain data`);
-            return nodeTransformationFunc(body.data);
-        } catch (error) {
-            if (error.message.includes(429)) {
-                log(itemSpec, `${logPrefix} - Encountered rate limit error, waiting ${(retries + 1) * 10} seconds.`, LOG_TYPES.WARNING);
-                await sleep((retries + 1) * 10000);
-            } else {
-                Apify.utils.log.error(error);
-            }
-            retries++;
-        }
-    }
-    log(itemSpec, `${logPrefix} - Could not load more items`);
-    return { nextPageCursor: null, data: [] };
-}
-
-async function finiteQuery(queryId, variables, nodeTransformationFunc, limit, page, input, itemSpec, logPrefix) {
-    const gotParams = await getGotParams(page, input);
-
-    log(itemSpec, `${logPrefix} - Loading up to ${limit} items`);
-    let hasNextPage = true;
-    let endCursor = null;
-    const results = [];
-    while (hasNextPage && results.length < limit) {
-        const queryParams = {
-            query_hash: queryId,
-            variables: {
-                ...variables,
-                first: 50,
-            },
-        };
-        if (endCursor) queryParams.variables.after = endCursor;
-        const searchParams = new URLSearchParams([['query_hash', queryParams.query_hash], ['variables', JSON.stringify(queryParams.variables)]]);
-        const { nextPageCursor, data } = await query(gotParams, searchParams, nodeTransformationFunc, itemSpec, logPrefix);
-
-        data.forEach((result) => results.push(result));
-
-        if (nextPageCursor && results.length < limit) {
-            endCursor = nextPageCursor;
-            log(itemSpec, `${logPrefix} - So far loaded ${results.length} items`);
-        } else {
-            hasNextPage = false;
-        }
-    }
-    log(itemSpec, `${logPrefix} - Finished loading ${results.length} items`);
-    return results.slice(0, limit);
-}
-
-async function singleQuery(queryId, variables, nodeTransformationFunc, page, itemSpec, logPrefix) {
-    const gotParams = await getGotParams(page, itemSpec.input);
-    const searchParams = new URLSearchParams([['query_hash', queryId], ['variables', JSON.stringify(variables)]]);
-    return query(gotParams, searchParams, nodeTransformationFunc, itemSpec, logPrefix);
-}
-
-/**
  * @param {string} caption
  */
-function parseCaption(caption) {
-    if (!caption) {
-        return { hashtags: [], mentions: [] };
+const parseCaption = (caption) => {
+    /** @type {string[]} */
+    let hashtags = [];
+    /** @type {string[]} */
+    let mentions = [];
+
+    if (caption) {
+        // last part means non-spaced tags, like #some#tag#here
+        // works with unicode characters. de-duplicates tags and mentions
+        const HASHTAG_REGEX = /#([\S]+?)(?=\s|$|[#@])/gums;
+        const MENTION_REGEX = /@([\S]+?)(?=\s|$|[#@])/gums;
+        const clean = (regex) => [...new Set(([...caption.matchAll(regex)] || []).filter((s) => s[1]).map((s) => s[1].trim()))];
+        hashtags = clean(HASHTAG_REGEX);
+        mentions = clean(MENTION_REGEX);
     }
-    // last part means non-spaced tags, like #some#tag#here
-    // works with unicode characters. de-duplicates tags and mentions
-    const HASHTAG_REGEX = /#([\S]+?)(?=\s|$|[#@])/gums;
-    const MENTION_REGEX = /@([\S]+?)(?=\s|$|[#@])/gums;
-    const clean = (regex) => [...new Set(([...caption.matchAll(regex)] || []).filter((s) => s[1]).map((s) => s[1].trim()))];
-    const hashtags = clean(HASHTAG_REGEX);
-    const mentions = clean(MENTION_REGEX);
+
     return { hashtags, mentions };
-}
-
-function hasReachedLastPostDate(scrapePostsUntilDate, lastPostDate, itemSpec) {
-    const lastPostDateAsDate = new Date(lastPostDate);
-    if (scrapePostsUntilDate) {
-        // We want to continue scraping (return true) if the scrapePostsUntilDate is older (smaller) than the date of the last post
-        // Don't forget we scrape from the most recent ones to the past
-        scrapePostsUntilDateAsDate = new Date(scrapePostsUntilDate);
-        const willContinue = scrapePostsUntilDateAsDate < lastPostDateAsDate;
-        if (!willContinue) {
-            log(itemSpec, `Reached post with older date than our limit: ${lastPostDateAsDate}. Finishing scrolling...`, LOG_TYPES.WARNING);
-            return true;
-        }
-    }
-    return false;
-}
-
-// Ttems can be posts or commets from scrolling
-async function filterPushedItemsAndUpdateState({ items, itemSpec, parsingFn, scrollingState, type, page }) {
-    if (!scrollingState[itemSpec.id]) {
-        scrollingState[itemSpec.id] = {
-            allDuplicates: false,
-            ids: {},
-        };
-    }
-    const { limit, scrapePostsUntilDate } = itemSpec;
-    const currentScrollingPosition = Object.keys(scrollingState[itemSpec.id].ids).length;
-    const parsedItems = parsingFn(items, itemSpec, currentScrollingPosition);
-    let itemsToPush = [];
-    for (const item of parsedItems) {
-        if (Object.keys(scrollingState[itemSpec.id].ids).length >= limit) {
-            log(itemSpec, `Reached user provided limit of ${limit} results, stopping...`);
-            break;
-        }
-        if (scrapePostsUntilDate && hasReachedLastPostDate(scrapePostsUntilDate, item.timestamp, itemSpec)) {
-            scrollingState[itemSpec.id].reachedLastPostDate = true;
-            break;
-        }
-        if (!scrollingState[itemSpec.id].ids[item.id]) {
-            itemsToPush.push(item);
-            scrollingState[itemSpec.id].ids[item.id] = true;
-        } else {
-            // Apify.utils.log.debug(`Item: ${item.id} was already pushed, skipping...`);
-        }
-    }
-    // We have to tell the state if we are going though duplicates so it knows it should still continue scrolling
-    if (itemsToPush.length === 0) {
-        scrollingState[itemSpec.id].allDuplicates = true;
-    } else {
-        scrollingState[itemSpec.id].allDuplicates = false;
-    }
-    if (type === 'posts') {
-        if (itemSpec.input.expandOwners && itemSpec.pageType !== PAGE_TYPES.PROFILE) {
-            itemsToPush = await expandOwnerDetails(itemsToPush, page, itemSpec);
-        }
-
-        // I think this feature was added by Tin and it could possibly increase the runtime by A LOT
-        // It should be opt-in. Also needs to refactored!
-        /*
-        for (const post of output) {
-            if (itemSpec.pageType !== PAGE_TYPES.PROFILE && (post.locationName === null || post.ownerUsername === null)) {
-                // Try to scrape at post detail
-                await requestQueue.addRequest({ url: post.url, userData: { label: 'postDetail' } });
-            } else {
-                await Apify.pushData(post);
-            }
-        }
-        */
-    }
-    return itemsToPush;
-}
-
-const shouldContinueScrolling = ({ scrollingState, itemSpec, oldItemCount, type }) => {
-    if (type === 'posts') {
-        if (scrollingState[itemSpec.id].reachedLastPostDate) {
-            return false;
-        }
-    }
-
-    const itemsScrapedCount = Object.keys(scrollingState[itemSpec.id].ids).length;
-    const reachedLimit = itemsScrapedCount >= itemSpec.limit;
-    if (reachedLimit) {
-        console.warn(`Reached max results (posts or commets) limit: ${itemSpec.limit}. Finishing scrolling...`);
-    }
-    const shouldGoNextGeneric = !reachedLimit && (itemsScrapedCount !== oldItemCount || scrollingState[itemSpec.id].allDuplicates);
-    return shouldGoNextGeneric;
-};
-
-/**
- * @param {{
- *   itemSpec: any,
- *   page: Puppeteer.Page,
- *   retry?: number,
- *   type: 'posts' | 'comments'
- * }} params
- */
-const loadMore = async ({ itemSpec, page, retry = 0, type }) => {
-    // console.log('Starting load more fn')
-    await page.keyboard.press('PageUp');
-    const checkedVariable = getCheckedVariable(itemSpec.pageType);
-    const responsePromise = page.waitForResponse(
-        (response) => {
-            const responseUrl = response.url();
-            return responseUrl.startsWith(GRAPHQL_ENDPOINT)
-                && responseUrl.includes(checkedVariable)
-                && responseUrl.includes('%22first%22');
-        },
-        { timeout: 30000 },
-    ).catch(() => null);
-
-    // comments scroll up with button
-    let clicked = [];
-    for (let i = 0; i < 10; i++) {
-        let elements;
-        if (type === 'posts') {
-            elements = await page.$$('button.tCibT');
-        } else if (type === 'comments') {
-            elements = await page.$$('[aria-label="Load more comments"]');
-        } else {
-            throw new Error('Type has to be "posts" or "comments"!');
-        }
-
-        if (elements.length === 0) {
-            continue; // eslint-disable-line no-continue
-        }
-        const [button] = elements;
-
-        try {
-            clicked = await Promise.all([
-                button.click(),
-                page.waitForRequest(
-                    (request) => {
-                        const requestUrl = request.url();
-                        return requestUrl.startsWith(GRAPHQL_ENDPOINT)
-                            && requestUrl.includes(checkedVariable)
-                            && requestUrl.includes('%22first%22');
-                    },
-                    {
-                        timeout: 1000,
-                    },
-                ).catch(() => null),
-            ]);
-
-            await acceptCookiesDialog(page);
-
-            if (clicked[1]) break;
-        } catch (e) {
-            Apify.utils.log.debug('loadMore error', { error: e.message, stack: e.stack });
-
-            if (e.message.includes('Login')) {
-                throw e;
-            }
-
-            // "Node is either not visible or not an HTMLElement" from button.click(), would propagate and
-            // break the whole recursion needlessly
-            continue; // eslint-disable-line no-continue
-        }
-    }
-
-    // posts scroll down
-    let scrolled = [];
-    if (type === 'posts') {
-        for (let i = 0; i < 10; i++) {
-            scrolled = await Promise.all([
-                page.evaluate(() => window.scrollBy(0, 9999999)),
-                page.waitForRequest(
-                    (request) => {
-                        const requestUrl = request.url();
-                        return requestUrl.startsWith(GRAPHQL_ENDPOINT)
-                            && requestUrl.includes(checkedVariable)
-                            && requestUrl.includes('%22first%22');
-                    },
-                    {
-                        timeout: 1000,
-                    },
-                ).catch(() => null),
-            ]);
-            if (scrolled[1]) break;
-        }
-    }
-
-    let data = null;
-
-    // the [+] button is removed from page when no more comments are loading
-    if (type === 'comments' && !clicked.length && retry > 0) {
-        return { data };
-    }
-
-    const response = await responsePromise;
-    if (!response) {
-        log(itemSpec, 'Didn\'t receive a valid response in the current scroll, scrolling again...', LOG_TYPES.WARNING);
-    } else {
-        // if (scrolled[1] || clicked[1]) {
-        try {
-            // const response = await responsePromise;
-            // if (!response) {
-            //    log(itemSpec, `Didn't receive a valid response in the current scroll, scrolling more...`, LOG_TYPES.WARNING);
-            // } else {
-            const status = response.status();
-
-            if (status === 429) {
-                return { rateLimited: true };
-            }
-
-            if (status !== 200) {
-                // usually 302 redirecting to login, throwing string to remove the long stack trace
-                throw `Got error status while scrolling: ${status}. Retrying...`;
-            }
-
-            let json;
-            try {
-                json = await response.json();
-            } catch (e) {
-                log(itemSpec, 'Cannot parse response body', LOG_TYPES.EXCEPTION);
-                console.dir(response);
-            }
-
-            // eslint-disable-next-line prefer-destructuring
-            if (json) data = json.data;
-        } catch (error) {
-            // Apify.utils.log.error(error);
-            const errorMessage = error.message || error;
-            if (errorMessage.includes('Got error')) {
-                throw error;
-            } else {
-                log(itemSpec, 'Non fatal error occured while scrolling:', LOG_TYPES.WARNING);
-            }
-        }
-    }
-
-    if (type === 'comments') {
-        // delete nodes to make DOM less bloated
-        await page.evaluate(() => {
-            document.querySelectorAll('.EtaWk > ul > ul').forEach((s) => s.remove());
-        });
-    }
-
-    const retryDelay = (retry || 1) * 3500;
-
-    if (!data && retry < 4 && (scrolled[1] || retry < 5)) {
-        // We scroll the other direction than usual
-        if (type === 'posts') {
-            await page.evaluate(() => window.scrollBy(0, -1000));
-        }
-        log(itemSpec, `Retry scroll after ${retryDelay / 3500} seconds`);
-        await sleep(retryDelay);
-        return loadMore({ itemSpec, page, retry: retry + 1, type });
-    }
-
-    await sleep(retryDelay / 2);
-
-    return { data };
-};
-
-const finiteScroll = async (context) => {
-    const {
-        itemSpec,
-        page,
-        scrollingState,
-        getItemsFromGraphQLFn,
-        type,
-        session,
-    } = context;
-    // console.log('starting finite scroll');
-    const oldItemCount = Object.keys(scrollingState[itemSpec.id].ids).length;
-    const { data, rateLimited } = await loadMore({ itemSpec, page, type });
-
-    if (rateLimited) {
-        log(itemSpec, 'Scrolling got blocked by Instagram, finishing! Please increase the "scrollWaitSecs" input and run again.', LOG_TYPES.EXCEPTION);
-        return;
-    }
-
-    // console.log('Getting data from graphQl')
-    if (data) {
-        const { hasNextPage } = getItemsFromGraphQLFn({ data, pageType: itemSpec.pageType });
-        if (!hasNextPage) {
-            // log(itemSpec, 'Cannot find new page of scrolling, storing last page dump to KV store', LOG_TYPES.WARNING);
-            // await Apify.setValue(`LAST-PAGE-DUMP-${itemSpec.id}`, data);
-            // We have to do these retires because the browser sometimes hang on, should be fixable with something else though
-            session.retire();
-
-            // this is actually expected, the total count usually isn't the amount of actual loaded comments/posts
-            return;
-        }
-    }
-    // console.log('Got data from graphQl')
-
-    // There is a rate limit in scrolling, we don;t know exactly how much
-    // If you reach it, it will block you completely so it is necessary to wait more in scrolls
-    // Seems the biggest block chance is when you are over 2000 items
-    const { scrollWaitSecs } = itemSpec;
-    if (oldItemCount > 1000) {
-        const modulo = oldItemCount % 100;
-        if (modulo >= 0 && modulo < 12) { // Every 100 posts: Wait random for user passed time with some randomization
-            const waitSecs = Math.round(scrollWaitSecs * (Math.random() + 1));
-            log(itemSpec, `Sleeping for ${waitSecs} seconds to prevent getting rate limit error..`);
-            await sleep(waitSecs * 1000);
-        }
-    }
-
-    // Small ranom wait (200-600ms) in between each scroll
-    const waitMs = Math.round(200 * (Math.random() * 2 + 1));
-    // console.log(`Waiting for ${waitMs} ms`);
-    await sleep(waitMs);
-
-    const doContinue = shouldContinueScrolling({ scrollingState, itemSpec, oldItemCount, type });
-
-    if (doContinue) {
-        await finiteScroll(context);
-    }
-};
-
-/**
- * Load data from XHR request using current page cookies and headers
- * @param {{
- *   request: Apify.Request,
- *   page: Puppeteer.Page,
- *   url: string,
- *   proxyUrl?: string,
- *   csrf_token: string
- * }} params
- */
-const loadXHR = async ({ request, page, url, proxyUrl, csrf_token }) => {
-    const cookies = await page.cookies();
-    let serializedCookies = '';
-    for (const cookie of cookies) {
-        serializedCookies += `${cookie.name}=${cookie.value}; `;
-    }
-    const userAgent = await page.evaluate(() => navigator.userAgent);
-    const headers = {
-        referer: request.url,
-        'x-csrftoken': csrf_token,
-        cookie: serializedCookies,
-        'user-agent': userAgent,
-        ...HEADERS,
-    };
-
-    const res = await requestAsBrowser({
-        url,
-        timeoutSecs: 30,
-        proxyUrl,
-        headers,
-    });
-
-    return res;
-};
-
-/**
- * @param {Puppeteer.Page} page
- */
-const acceptCookiesDialog = async (page) => {
-    const acceptBtn = '[role="dialog"] button:first-of-type';
-
-    try {
-        await page.waitForSelector(acceptBtn, { timeout: 5000 });
-    } catch (e) {
-        return false;
-    }
-
-    await Promise.all([
-        page.waitForResponse(() => true),
-        page.click(acceptBtn),
-    ]);
-
-    return true;
 };
 
 /**
@@ -734,7 +560,7 @@ const extendFunction = async ({
 
         for (const item of await splitMap(data, merged)) {
             if (filter && !(await filter({ data, item }, merged))) {
-                continue; // eslint-disable-line no-continue
+                continue;
             }
 
             const result = await (evaledFn.runInThisContext()({
@@ -755,19 +581,287 @@ const extendFunction = async ({
     };
 };
 
+/**
+ * Do a generic check when using Apify Proxy
+ *
+ * @typedef params
+ * @property {any} [params.proxyConfig] Provided apify proxy configuration
+ * @property {boolean} [params.required] Make the proxy usage required when running on the platform
+ * @property {string[]} [params.blacklist] Blacklist of proxy groups, by default it's ['GOOGLE_SERP']
+ * @property {boolean} [params.force] By default, it only do the checks on the platform. Force checking regardless where it's running
+ * @property {string[]} [params.hint] Hint specific proxy groups that should be used, like SHADER or RESIDENTIAL
+ *
+ * @param {params} params
+ * @returns {Promise<Apify.ProxyConfiguration | undefined>}
+ */
+const proxyConfiguration = async ({
+    proxyConfig,
+    required = true,
+    force = Apify.isAtHome(),
+    blacklist = ['GOOGLESERP'],
+    hint = [],
+}) => {
+    const configuration = await Apify.createProxyConfiguration(proxyConfig);
+
+    // this works for custom proxyUrls
+    if (Apify.isAtHome() && required) {
+        if (!configuration || (!configuration.usesApifyProxy && (!configuration.proxyUrls || !configuration.proxyUrls.length)) || !configuration.newUrl()) {
+            throw new Error('\n=======\nYou must use Apify proxy or custom proxy URLs\n\n=======');
+        }
+    }
+
+    // check when running on the platform by default
+    if (force) {
+        // only when actually using Apify proxy it needs to be checked for the groups
+        if (configuration && configuration.usesApifyProxy) {
+            if (blacklist.some((blacklisted) => (configuration.groups || []).includes(blacklisted))) {
+                throw new Error(`\n=======\nThese proxy groups cannot be used in this actor. Choose other group or contact support@apify.com to give you proxy trial:\n\n*  ${blacklist.join('\n*  ')}\n\n=======`);
+            }
+
+            // specific non-automatic proxy groups like RESIDENTIAL, not an error, just a hint
+            if (hint.length && !hint.some((group) => (configuration.groups || []).includes(group))) {
+                log.info(`\n=======\nYou can pick specific proxy groups for better experience:\n\n*  ${hint.join('\n*  ')}\n\n=======`);
+            }
+        }
+    }
+
+    return configuration;
+};
+
+/**
+ * Patch input. Mutates the object
+ *
+ * @param {any} input
+ */
+const patchInput = (input) => {
+    if (input) {
+        if (typeof input.extendOutputFunction === 'string' && !input.extendOutputFunction.startsWith('async')) {
+            // old extend output function, rewrite it to use the new format that will be
+            // picked by the extendFunction helper
+            if (input.extendOutputFunction) {
+                log.warning(`\n-------\nYour "extendOutputFunction" parameter is wrong, so it's being defaulted to a working one. Please change it to conform to the proper format or leave it empty\n-------\n`);
+            }
+            input.extendOutputFunction = '';
+        }
+
+        if (!input.untilDate && typeof input.scrapePostsUntilDate === 'string' && input.scrapePostsUntilDate) {
+            log.warning(`\n-------\nYou are using "scrapePostsUntilDate" and it's deprecated. Prefer using "untilDate" as it works for both posts and comments`);
+            input.untilDate = input.scrapePostsUntilDate;
+        }
+    }
+};
+
+/**
+ * No handleRequestFunction errors
+ *
+ * @param {Apify.BrowserCrawler} crawler
+ */
+const patchLog = (crawler) => {
+    const originalException = crawler.log.exception.bind(crawler.log);
+    crawler.log.exception = (...args) => {
+        if (!args?.[1]?.includes('handleRequestFunction')) {
+            originalException(...args);
+        }
+    };
+};
+
+/**
+ * @param {*} value
+ * @returns
+ */
+const parseTimeUnit = (value) => {
+    if (!value) {
+        return null;
+    }
+
+    if (value === 'today' || value === 'yesterday') {
+        return (value === 'today' ? moment() : moment().subtract(1, 'day')).startOf('day');
+    }
+
+    const [, number, unit] = `${value}`.match(/^(\d+)\s?(minute|second|day|hour|month|year|week)s?$/i) || [];
+
+    if (+number && unit) {
+        return moment().subtract(+number, unit);
+    }
+
+    return moment(value);
+};
+
+/**
+ * @typedef MinMax
+ * @property {number | string} [min]
+ * @property {number | string} [max]
+ */
+
+/**
+ * @typedef {ReturnType<typeof minMaxDates>} MinMaxDates
+ */
+
+/**
+ * Generate a function that can check date intervals depending on the input
+ * @param {MinMax} param
+ */
+const minMaxDates = ({ min, max }) => {
+    let minDate = parseTimeUnit(min);
+    let maxDate = parseTimeUnit(max);
+
+    if (minDate && maxDate && maxDate.diff(minDate) < 0) {
+        log.warning(`Minimum date ( ${minDate.toString()} ) needs to be less than max date ( ${maxDate.toString()} ). Swapping input dates.`);
+        const minDateValue = minDate;
+        minDate = maxDate;
+        maxDate = minDateValue;
+    }
+
+    return {
+        /**
+         * cloned min date, if set
+         */
+        get minDate() {
+            return minDate?.clone();
+        },
+        /**
+         * cloned max date, if set
+         */
+        get maxDate() {
+            return maxDate?.clone();
+        },
+        /**
+         * compare the given date/timestamp to the time interval
+         * @param {string | number} time
+         */
+        compare(time) {
+            const base = moment(time);
+            return (minDate ? minDate.diff(base) <= 0 : true) && (maxDate ? maxDate.diff(base) >= 0 : true);
+        },
+    };
+};
+
+/**
+ * @template {string} C
+ * @param {C} prop
+ * @returns {<T extends { [C]: any }>(obj: T) => T[C] | never}
+ */
+const mapProp = (prop) => (obj) => obj?.[prop];
+
+const dedupById = dedupArrayByProperty('id');
+const mapNode = mapProp('node');
+
+/**
+ * @param {number} value
+ */
+const secondsToDate = (value) => {
+    // eslint-disable-next-line no-nested-ternary
+    return +value ? new Date(value * 1000).toISOString() : (value ? `${value}` : null);
+};
+
+/**
+ * Extract `node` from the array
+ *
+ * @param {any[]} arr
+ */
+const arrayNodes = (arr) => (arr && Array.isArray(arr) ? arr : []).map(mapNode);
+
+/**
+ * @param {any[]} arr
+ * @returns {string[]}
+ */
+const edgesToText = (arr) => {
+    return arrayNodes(arr)
+        .map(({ text }) => text?.trim())
+        .filter(Boolean);
+};
+
+/**
+ * Handles the response from page.on('response', ...)
+ * @param { Puppeteer.HTTPResponse } response
+ * @returns
+ */
+
+const handleResponse = async (response) => {
+    const responseObject = {
+        code: 0,
+    };
+    try {
+        responseObject.code = await response.status();
+        responseObject.data = await response.json();
+    } catch (e) {
+        responseObject.error = e;
+    }
+    return responseObject;
+};
+
+/**
+ * Parses the script file if there is no valid XHR
+ * @param { Puppeteer.Page } page
+ * @returns
+*/
+
+const parsePageScript = async (page) => {
+    const scripts = await page.$$eval('script', (scripts) => scripts.map((script) => script.innerHTML));
+    for (const script of scripts) {
+        // parse script with window._sharedData
+        if (script.includes('window._sharedData')) {
+            const parsedScript = script.replace('window._sharedData = ', '').slice(0, -1);
+            return eval(`(${parsedScript})`).entry_data?.ProfilePage?.[0]?.graphql?.user;
+        } if (script.includes('highlight_reel_count')) {
+            const json = script.split(`"result":`)?.[1]?.slice(0, -15);
+            return eval(`(${JSON.parse(json).response})`).data.user;
+        } if (script.includes('HasteSupportData')) {
+            log.debug('Found HasteSupportData, no shareddata nor highlight_reel_count');
+        }
+    }
+};
+
+/**
+ * Generates random wait durations
+ * @param { Number } min
+ * @param { Number } max
+ * @returns { Number }
+*/
+
+const randomScrollWaitDuration = (min, max) => {
+    return Math.floor(Math.random() * (max - min + 1) + min);
+};
+
+const sanitizeInput = (input) => {
+    // If user inputs posts -> posts (invalid), we can convert it to posts -> details which is a valid
+    const areUrlsPosts = input.directUrls?.length > 0
+        && input.directUrls.every((url) => getPageTypeFromUrl(url) === PAGE_TYPES.POST);
+    if (areUrlsPosts && (input.resultsType === SCRAPE_TYPES.POSTS || input.resultsType === SCRAPE_TYPES.DETAILS)) {
+        input.resultsType = SCRAPE_TYPES.POST_DETAIL;
+    }
+};
+
 module.exports = {
     getPageTypeFromUrl,
-    getItemSpec,
+    randomScrollWaitDuration,
     getCheckedVariable,
-    log,
-    finiteQuery,
-    acceptCookiesDialog,
-    singleQuery,
+    queryHash,
     parseCaption,
     extendFunction,
-    filterPushedItemsAndUpdateState,
-    finiteScroll,
-    shouldContinueScrolling,
-    loadXHR,
-    coalesce,
+    minMaxDates,
+    proxyConfiguration,
+    createGotRequester,
+    patchLog,
+    patchInput,
+    uppercaseFirstLetter,
+    formatJSONAddress,
+    singleQuery,
+    query,
+    finiteQuery,
+    acceptCookiesDialog,
+    deferred,
+    addLoopToPage,
+    getEntryData,
+    getAdditionalData,
+    dedupArrayByProperty,
+    dedupById,
+    mapNode,
+    mapProp,
+    arrayNodes,
+    edgesToText,
+    secondsToDate,
+    handleResponse,
+    parsePageScript,
+    sanitizeInput,
 };

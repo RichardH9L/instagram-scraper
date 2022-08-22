@@ -1,3 +1,89 @@
+### 2022-06-03
+Fix:
+- `loginCookies` now use only a single cookie with name `sessionid`. All other cookies are now removed. This improves reliability of scraping behind login.
+
+### 2022-03-07
+
+Feature:
+- Add searchTerm and type to the debug output
+- Update SDK version
+
+Fix:
+- Log for followers/following
+
+### 2022-01-06
+
+Features:
+- Add new URL type `/tv/` for videos
+- Make `includeRelatedProfiles` an input option
+- Using browser fingerprints with incognito mode
+
+Fix:
+- Random stuck runs
+- Not getting all loaded comments on page load
+
+### 2021-11-14
+
+Features:
+- Complete rewrite of code
+- Standardized output between logged in and public scrapes
+- Better login session management
+- Added `relatedProfiles`
+
+Fix:
+- Logged in information
+- Stuck scraping scroll types (posts and comments)
+- Better performance
+- Less wasteful loops
+- Followers, following, tagged posts, location for posts
+- Don't get stuck with dead proxies
+- Comments counts
+
+Breaking changes:
+- Removed login server (username / password)
+- Format have changed for `#debug` key
+- Some inputs were removed
+- Fails the run when providing RESIDENTIAL with login cookies
+- Invalid cookies are not allowed to run
+
+### 2021-10-22
+
+Fix:
+- Workaround for additional data loaded
+- Missing posts from profiles
+
+### 2021-09-18
+
+Features:
+- Add "Include tagged posts"
+
+Fix:
+- Hashtag search with cookies
+
+Changes:
+- Save login state on migration
+
+### 2021-08-02
+
+Features:
+- Update to SDK 2
+- Better UX
+- Output profiles from search
+- Minimum and maximum dates
+- Multiple search terms separated by commas
+
+Changes:
+- Deprecated `scrapePostsUntilDate`, use `untilDate` instead
+
+Bug fixes:
+- Stories
+- Scrolling for hashtag, posts, comments and location
+- Login cookies and management
+- Cookies export
+- Lessen the redirects
+- Proper datacenter proxy support
+- Implemented Extend Output Function
+
 ### 2021-03-16
 
 #### Bug fixes

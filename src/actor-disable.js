@@ -1,0 +1,32 @@
+const { getPageTypeFromUrl } = require('./helpers');
+const { PAGE_TYPES, SCRAPE_TYPES } = require('./consts');
+
+module.exports.maybeDisableActor = (input) => {
+    // We want to be able to run the actor even with some inputs not allowed for normal users 
+    if (input.debugLog) {
+        return;
+    }
+
+    const startUrl = input.directUrls?.[0];
+    const pageType = startUrl ? getPageTypeFromUrl(startUrl) : PAGE_TYPES.HASHTAG;
+    const isLogin = input.loginCookies?.length > 0;
+    console.log(`page type: ${pageType}`);
+
+    const isProfileToDetails = pageType === PAGE_TYPES.PROFILE && input.resultsType === SCRAPE_TYPES.DETAILS;
+    const isPostToDetails = pageType === PAGE_TYPES.POST && input.resultsType === SCRAPE_TYPES.POST_DETAIL;
+    const isPostToComments = pageType === PAGE_TYPES.POST && input.resultsType === SCRAPE_TYPES.COMMENTS;
+    const isPlacesPostsWithCookie = pageType === PAGE_TYPES.PLACE && input.resultsType === SCRAPE_TYPES.POSTS && isLogin;
+    const isProfileToPosts = pageType === PAGE_TYPES.PROFILE && input.resultsType === SCRAPE_TYPES.POSTS;
+    const isPostsToHashtagsWithCookie = pageType === PAGE_TYPES.HASHTAG && input.resultsType === SCRAPE_TYPES.POSTS && isLogin;
+    if (isProfileToDetails || isPostToDetails || isProfileToPosts || isPostToComments || isPlacesPostsWithCookie || isPostsToHashtagsWithCookie) {
+        // we can run this
+        return;
+    }
+
+    throw `******\nINSTAGRAM SCRAPER DOESN'T WORK FOR SOME INPUTS!\nInstagram changed layout of their page and most input types stopped working\n`
+    + `Currently working inputs:\n\nProfile details\nPost details\nProfile posts \nPlaces Posts (only with login cookies)\nPost comments\nHashtag posts (only with login cookies)\n\n`
+    + `We decided to completely disable this scraper until this issue is resolved to prevent further spending of your credits\n`
+    + `Some use-cases should be enabled today or tomorrow, most till the end of the week\n`
+    + `We will notify you on email once this actor is enabled again\n`
+    + `*****`;
+};

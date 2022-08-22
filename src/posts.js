@@ -1,17 +1,10 @@
+// eslint-disable-next-line no-unused-vars
 const Apify = require('apify');
-const { getCheckedVariable, log, finiteScroll, filterPushedItemsAndUpdateState, shouldContinueScrolling } = require('./helpers');
-const { PAGE_TYPES, LOG_TYPES } = require('./consts');
-const { formatSinglePost } = require('./details');
-
-const { sleep } = Apify.utils;
-
-const initData = {};
-
+const { PAGE_TYPES } = require('./consts');
 /**
- * Takes type of page and data loaded through GraphQL and outputs
- * correct list of posts based on the page type.
- * @param {String} pageType Type of page we are scraping posts from
- * @param {Object} data GraphQL data
+ * Add a post
+ *
+ * @param {Apify.RequestQueue} requestQueue
  */
 const getPostsFromGraphQL = ({ pageType, data }) => {
     let timeline;
@@ -84,7 +77,7 @@ const scrapePost = (request, itemSpec, entryData, additionalData) => {
         locationName: (item.location && item.location.name) || null,
         ownerUsername: (item.owner && item.owner.username) || null,
         ownerProfilePicUrl: (item.owner && item.owner.profile_pic_url) || null,
-        ownerProfilePicUrlHd: (item.owner && item.owner.profile_pic_url_hd) || null
+        ownerProfilePicUrlHd: (item.owner && item.owner.profile_pic_url_hd) || null,
     };
 };
 
@@ -251,7 +244,5 @@ function parsePostsForOutput(posts, itemSpec, currentScrollingPosition) {
 }
 
 module.exports = {
-    scrapePost,
-    scrapePosts,
-    handlePostsGraphQLResponse,
+    createAddPost,
 };
